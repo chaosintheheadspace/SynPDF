@@ -1366,6 +1366,7 @@ dotdiff:v := tdiff;
   result := dst-dst_beg;
 end;
 
+{$HINTS OFF} // HKS_DP 16.01.2018
 function SynLZdecompress2(src: PAnsiChar; size: integer; dst: PAnsiChar): integer;
 var {$ifopt C+}dst_beg,{$endif} last_hashed: PAnsiChar; // initial src and dst value
     src_end: PAnsiChar;
@@ -1470,5 +1471,6 @@ nextCW:
   assert(result=dst-dst_beg);
   {$endif}
 end;
+{$HINTS ON}
 
 end.
