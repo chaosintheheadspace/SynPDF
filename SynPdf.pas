@@ -1618,6 +1618,7 @@ type
     FWorldFactorX, FWorldFactorY, FWorldOffsetX, FWorldOffsetY, FAngle,
     FWorldCos, FWorldSin: single;
     FDevScaleX, FDevScaleY: single;
+    FScaleFactor: Single; // HKS_DP 06.11.2013
     FWinSize, FViewSize: TSize;
     FWinOrg, FViewOrg: TPoint;
     FMappingMode: Integer;
@@ -2016,6 +2017,7 @@ type
     // ends optional content (layer)
     procedure EndMarkedContent;
   public
+    property ScaleFactor: Single read FScaleFactor write FScaleFactor; // HKS_DP 06.11.2013
     /// retrieve the current Canvas content stream, i.e. where the PDF
     // commands are to be written to
     property Contents: TPdfStream read FContents;
@@ -9790,8 +9792,8 @@ begin
   try
     FOffsetXDef := XOff;
     FOffsetYDef := YOff;
-    FDevScaleX := ScaleX * FFactor;
-    FDevScaleY := ScaleY * FFactor;
+    FDevScaleX := ScaleX * FFactor * FScaleFactor;
+    FDevScaleY := ScaleY * FFactor * FScaleFactor;
     FEmfBounds := R; // keep device rect
     fUseMetaFileTextPositioning := TextPositioning;
     fUseMetaFileTextClipping := TextClipping;
@@ -10899,7 +10901,7 @@ begin
             PInc := 4;
           for y := 0 to fPixelHeight-1 do
             FWriter.AddRGB(B.ScanLine[y],PInc,fPixelWidth);
-          if (PInc=3) and (B.TransparentMode=tmFixed) then begin
+          if (PInc=3) {and (B.TransparentMode=tmFixed)} then begin // HKS_DP 07.11.13 Transparenz auch für tmAuto ermöglichen
             // [ min1 max1 ... minn maxn ]
             TransparentColor := B.TransparentColor;
             FAttributes.AddItem('Mask',TPdfArray.CreateReals(nil,
