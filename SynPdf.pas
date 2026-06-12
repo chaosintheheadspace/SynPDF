@@ -1313,7 +1313,7 @@ type
     /// save the PDF file content into a specified file
     // - return FALSE on any writing error (e.g. if the file is opened in the
     // Acrobar Reader)
-    function SaveToFile(const aFileName: TFileName): boolean;
+    function SaveToFile(const aFileName: TFileName): String; // HKS_PH 03.11.2016
     /// retrieve a XObject from its name
     // - this method will handle also the Virtual Objects
     function GetXObject(const AName: PDFString): TPdfXObject;
@@ -5882,20 +5882,21 @@ begin
   raise EPdfInvalidOperation.Create('TPdfDocument.Document is null');
 end;
 
-function TPdfDocument.SaveToFile(const aFileName: TFileName): boolean;
+// HKS_PH 03.11.2016
+function TPdfDocument.SaveToFile(const aFileName: TFileName): String;
 var FS: TFileStream;
 begin
+  result := '';
   try
     FS := TFileStream.Create(aFileName,fmCreate);
     try
       SaveToStream(FS);
-      result := true;
     finally
       FS.Free;
     end;
   except
     on E: Exception do // error on file creation (opened in reader?)
-      result := false;
+      result := E.Message;
   end;
 end;
 
