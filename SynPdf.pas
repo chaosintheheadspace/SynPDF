@@ -7559,9 +7559,9 @@ end;
 function TPdfCanvas.RectI(Rect: TRect; Normalize: boolean): TPdfRect;
 begin
   result.Left := I2X(Rect.Left);
-  result.Right := I2X(Rect.Right-1);
+  result.Right := I2X(Rect.Right);
   result.Top := I2Y(Rect.Top);
-  result.Bottom := I2Y(Rect.Bottom-1);
+  result.Bottom := I2Y(Rect.Bottom);
   if Normalize then
     NormalizeRect(result);
 end;
