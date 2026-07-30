@@ -10648,7 +10648,8 @@ begin
         backRect.TopLeft := Posi;
         backRect.BottomRight := Posi;
         inc(backRect.Right,Trunc(wW));
-        inc(backRect.Bottom,Abs(font.LogFont.lfHeight));
+        dec(backRect.Top,Abs(font.LogFont.lfHeight));
+        inc(backRect.Bottom,Abs(font.spec.descent));
       end;
     NormalizeRect(backRect);
     if WithClip then begin
