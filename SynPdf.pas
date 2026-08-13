@@ -1159,6 +1159,7 @@ type
     FOutlineRoot: TPdfOutlineRoot;
     FStructTree: TPdfDictionary;
     FXObjectList: TPdfArray;
+    FPatternList: TPdfArray;
     FDefaultPageWidth: cardinal;
     FDefaultPageHeight: Cardinal;
     FDefaultPaperSize: TPDFPaperSize;
@@ -1290,6 +1291,12 @@ type
     /// add then register an object (typicaly a TPdfImage) to the PDF document
     // - returns the internal index as added in FXObjectList[]
     function AddXObject(const AName: PDFString; AXObject: TPdfXObject): integer;
+    /// register a TPdfPattern (tiling pattern) object to the PDF document
+    // - returns the internal index as added in FPatternList[]
+    function RegisterPattern(AObject: TPdfXObject; const AName: PDFString): integer;
+    /// add then register a TPdfPattern (tiling pattern) object to the PDF document
+    // - returns the internal index as added in FPatternList[]
+    function AddPattern(const AName: PDFString; APattern: TPdfXObject): integer;
     /// save the PDF file content into a specified Stream
     procedure SaveToStream(AStream: TStream; ForceModDate: TDateTime=0); virtual;
     /// prepare to save the PDF file content into a specified Stream
@@ -1317,6 +1324,8 @@ type
     /// retrieve a XObject from its name
     // - this method will handle also the Virtual Objects
     function GetXObject(const AName: PDFString): TPdfXObject;
+    /// retrieve a TPdfPattern (tiling pattern) object from its name
+    function GetPattern(const AName: PDFString): TPdfXObject;
     /// retrieve a XObject index from its name
     // - this method won't handle the Virtual Objects
     function GetXObjectIndex(const AName: PDFString): integer;
@@ -1625,6 +1634,10 @@ type
     FEmfBounds: TRect;
     FPrinterPxPerInch: TPoint;
     FNewPath: Boolean;
+    // caches the last pattern name set via SetFillPattern, to avoid redundant
+    // 'cs'/'scn' emission - independent from any solid-color cache, since
+    // color space is a separate axis from color
+    fFillPatternName: PDFString;
     {$ifdef USE_UNISCRIBE}
     /// if Uniscribe-related methods must handle the text from right to left
     fRightToLeftText: Boolean;
@@ -1930,6 +1943,10 @@ type
     /// Set the color space to a CMYK value
     // - this method set the color to use for stroking operations
     procedure SetCMYKStrokeColor(C, M, Y, K: integer);               {  K  }
+    /// Set the color space to a Pattern (Type 1 tiling pattern), for
+    // nonstroking (fill) operations - registers APatternName into the
+    // current page's /Resources/Pattern dictionary if not already present
+    procedure SetFillPattern(const APatternName: PDFString);      { cs scn }
 
     /// assign the canvas to the specified page
     procedure SetPage(APage: TPdfPage); virtual;
@@ -2616,6 +2633,33 @@ type
     /// close the internal canvas
     procedure CloseCanvas;
     /// access to the private canvas associated with the PDF form XObject
+    property Canvas: TPdfCanvas read FCanvas;
+  end;
+
+  /// a PDF Type 1 (colored) tiling pattern, with a Canvas for drawing the tile
+  // - used to render GDI monochrome pattern brushes (EMR_CREATEMONOBRUSH) as
+  // a real tiled pattern instead of an averaged solid color - see EnumEMFFunc
+  TPdfPattern = class(TPdfXObject)
+  private
+    FResources: TPdfDictionary;
+    FPage: TPdfPage;
+    FCanvas: TPdfCanvas;
+  public
+    /// create a Type 1 tiling pattern XObject with a TPdfCanvas
+    // - TileW/TileH is the pattern cell size in PDF points, used for both
+    // the /BBox and the /XStep,/YStep repeat distance (seamless tiling)
+    constructor Create(aDoc: TPdfDocument; TileW, TileH: single); reintroduce;
+    /// release used memory
+    destructor Destroy; override;
+    /// close the internal canvas
+    procedure CloseCanvas;
+    /// draw an already-registered image XObject to fill the whole pattern
+    // cell - wires it directly into this pattern's own FResources (not via
+    // TPdfCanvas.DrawXObject/DrawXObjectPrepare, which expect FPage to own
+    // its own independent /Resources - sharing one Resources dictionary
+    // between FPage and FAttributes would double-free it on Destroy)
+    procedure DrawTile(const AImgName: PDFString; TileW, TileH: single);
+    /// access to the private canvas associated with the pattern's content stream
     property Canvas: TPdfCanvas read FCanvas;
   end;
 
@@ -5513,6 +5557,24 @@ begin
      result := -1;
 end;
 
+function TPdfDocument.RegisterPattern(AObject: TPdfXObject; const AName: PDFString): integer;
+begin
+   // check object and register it
+   if AObject=nil then
+     raise EPdfInvalidValue.Create('RegisterPattern: no AObject');
+   if AObject.Attributes.TypeOf<>'Pattern' then
+     raise EPdfInvalidValue.Create('RegisterPattern: no Pattern');
+   if AObject.ObjectType<>otIndirectObject then
+     FXref.AddObject(AObject);
+   if AObject.Attributes.ValueByName('Name')=nil then begin
+     if GetPattern(AName)<>nil then
+       raise EPdfInvalidValue.Createfmt('RegisterPattern: dup name %s', [AName]);
+     result := FPatternList.AddItem(AObject);
+     AObject.Attributes.AddItem('Name', AName);
+   end else
+     result := -1;
+end;
+
 const
   PDF_PRODUCER = 'Synopse PDF engine '+SYNOPSE_FRAMEWORK_VERSION;
 
@@ -5559,6 +5621,23 @@ var i: integer;
 begin
   for i := 0 to FXObjectList.ItemCount-1 do begin
     result := TPdfXObject(FXObjectList.FArray.List[i]);
+    if result.FObjectType=otVirtualObject then begin
+      result := TPdfXObject(FXRef.GetObject(result.FObjectNumber));
+      if (result=nil) or not result.InheritsFrom(TPdfXObject) then
+        continue;
+    end;
+    if result.Attributes<>nil then
+      if TPdfName(result.Attributes.ValueByName('Name')).Value=AName then
+        exit;
+  end;
+  Result := nil;
+end;
+
+function TPdfDocument.GetPattern(const AName: PDFString): TPdfXObject;
+var i: integer;
+begin
+  for i := 0 to FPatternList.ItemCount-1 do begin
+    result := TPdfXObject(FPatternList.FArray.List[i]);
     if result.FObjectType=otVirtualObject then begin
       result := TPdfXObject(FXRef.GetObject(result.FObjectNumber));
       if (result=nil) or not result.InheritsFrom(TPdfXObject) then
@@ -5717,6 +5796,8 @@ begin
   FFontList := TList.Create;
   FXObjectList := TPdfArray.Create(FXref);
   FXObjectList.FSaveAtTheEnd := true;
+  FPatternList := TPdfArray.Create(FXref);
+  FPatternList.FSaveAtTheEnd := true;
   FObjectList := TList.Create;
   FRoot := TPdfCatalog.Create;
   FRoot.FOwner := self;
@@ -5820,6 +5901,17 @@ begin
   result := RegisterXObject(AXObject, AName);
 end;
 
+function TPdfDocument.AddPattern(const AName: PDFString; APattern: TPdfXObject): integer;
+begin
+  if GetPattern(AName)<>nil then
+    raise EPdfInvalidValue.CreateFmt('AddPattern: dup name %s', [AName]);
+  if (APattern=nil) or (APattern.Attributes=nil) or
+    (APattern.Attributes.TypeOf<>'Pattern') then
+    raise EPdfInvalidValue.CreateFmt('AddPattern: invalid TPdfPattern %s', [AName]);
+  FXref.AddObject(APattern);
+  result := RegisterPattern(APattern, AName);
+end;
+
 function TPdfDocument.AddPage: TPdfPage;
 var FResources: TPdfDictionary;
 begin
@@ -5858,6 +5950,7 @@ var i: integer;
 begin
   if FXObjectList<>nil then begin
     FreeAndNil(FXObjectList);
+    FreeAndNil(FPatternList);
     for i := FFontList.Count-1 downto 0 do
       TObject(FFontList.List[i]).Free;
     FreeAndNil(FFontList);
@@ -6492,6 +6585,10 @@ begin
   FPageFontList := FPage.GetResources('Font');
   FContents := TPdfStream(FPage.ValueByName('Contents'));
   FFactor := 72/FDoc.FScreenLogPixels; // PDF expect 72 pixels per inch
+  // ab hier wird in einen anderen Content-Stream geschrieben, in dem noch
+  // kein Farbraum gesetzt ist - der Cache darf also keinen Treffer melden,
+  // sonst unterblieben cs/scn und der Eintrag in /Resources/Pattern
+  fFillPatternName := '';
 end;
 
 procedure TPdfCanvas.SetPDFFont(AFont: TPdfFont; ASize: Single);
@@ -6952,6 +7049,12 @@ procedure TPdfCanvas.GRestore;
 begin
   if FContents<>nil then
     FContents.Writer.Add('Q'#10);
+  // Q stellt den Grafikzustand des zugehoerigen q wieder her, also auch den
+  // Fuellfarbraum. Welches Muster danach aktiv ist, laesst sich hier nicht
+  // ohne einen eigenen q/Q-Stack bestimmen - daher konservativ verwerfen.
+  // Schlimmstenfalls wird cs/scn einmal ueberfluessig geschrieben, nie zu
+  // wenig.
+  fFillPatternName := '';
 end;
 
 procedure TPdfCanvas.ConcatToCTM(a, b, c, d, e, f: Single; Decimals: Cardinal);
@@ -7254,6 +7357,7 @@ procedure TPdfCanvas.SetRGBFillColor(Value: TPdfColor);
 begin
   if FContents<>nil then
     FContents.Writer.AddColorStr(Value).Add('rg'#10);
+  fFillPatternName := ''; // 'rg' resets the fill color space away from /Pattern
 end;
 
 procedure TPdfCanvas.SetRGBStrokeColor(Value: TPdfColor);
@@ -7267,6 +7371,7 @@ begin
   if FContents<>nil then
     FContents.Writer.AddWithSpace(C/100).AddWithSpace(M/100).
       AddWithSpace(Y/100).AddWithSpace(K/100).Add('k'#10);
+  fFillPatternName := ''; // 'k' resets the fill color space away from /Pattern
 end;
 
 procedure TPdfCanvas.SetCMYKStrokeColor(C, M, Y, K: integer);
@@ -7274,6 +7379,31 @@ begin
   if FContents<>nil then
     FContents.Writer.AddWithSpace(C/100).AddWithSpace(M/100).
       AddWithSpace(Y/100).AddWithSpace(K/100).Add('K'#10);
+end;
+
+procedure TPdfCanvas.SetFillPattern(const APatternName: PDFString);
+var Pattern: TPdfXObject;
+    Resources, Patterns: TPdfDictionary;
+begin
+  if FContents=nil then
+    exit;
+  if fFillPatternName=APatternName then
+    exit;
+  Pattern := FDoc.GetPattern(APatternName);
+  if Pattern=nil then
+    raise EPdfInvalidValue.CreateFmt('SetFillPattern: unknown %s', [APatternName]);
+  Resources := FPage.PdfDictionaryByName('Resources');
+  if Resources<>nil then begin
+    Patterns := Resources.PdfDictionaryByName('Pattern');
+    if Patterns=nil then begin
+      Patterns := TPdfDictionary.Create(FDoc.FXRef);
+      Resources.AddItem('Pattern', Patterns);
+    end;
+    if Patterns.ValueByName(APatternName)=nil then
+      Patterns.AddItem(APatternName, Pattern);
+  end;
+  FContents.Writer.Add('/Pattern cs /').Add(APatternName).Add(' scn'#10);
+  fFillPatternName := APatternName;
 end;
 
 function TPdfCanvas.TextWidth(const Text: PDFString): Single;
@@ -11064,6 +11194,70 @@ procedure TPdfFormWithCanvas.CloseCanvas;
 begin
   FreeAndNil(FCanvas);
   FreeAndNil(FPage);
+end;
+
+
+{ TPdfPattern }
+
+constructor TPdfPattern.Create(aDoc: TPdfDocument; TileW, TileH: single);
+begin
+  inherited Create(aDoc,true);
+  FResources := TPdfDictionary.Create(aDoc.FXref);
+  FResources.AddItem('XObject',TPdfDictionary.Create(nil));
+  FResources.AddItem('ProcSet',TPdfArray.CreateNames(nil,['PDF','ImageC']));
+  // FPage intentionally has no /Resources of its own (unlike a real page) -
+  // DrawTile() below wires the embedded image directly into FResources
+  // instead of via TPdfCanvas.DrawXObject/DrawXObjectPrepare, since those
+  // expect FPage to independently own a /Resources dict; sharing FResources
+  // itself between FPage and FAttributes would double-free it on Destroy
+  // (TPdfDictionaryElement.Destroy unconditionally frees its Value)
+  FPage := TPdfPage.Create(nil);
+  FCanvas := TPdfCanvas.Create(aDoc);
+  FCanvas.FPage := FPage;
+  FCanvas.FContents := self;
+  FCanvas.FFactor := 1;
+  FAttributes.AddItem('Type','Pattern');
+  FAttributes.AddItem('PatternType',1);
+  FAttributes.AddItem('PaintType',1);
+  FAttributes.AddItem('TilingType',1);
+  // BBox exactly equals XStep/YStep -> seamless tiling without overlap;
+  // must be the real (fractional) size, not rounded to integers, otherwise
+  // cell and repeat distance drift apart and the tile is scaled wrongly
+  FAttributes.AddItem('BBox',TPdfArray.CreateReals(nil,[0,0,TileW,TileH]));
+  FAttributes.AddItem('XStep',TPdfReal.Create(TileW));
+  FAttributes.AddItem('YStep',TPdfReal.Create(TileH));
+  FAttributes.AddItem('Matrix',TPdfRawText.Create('[1 0 0 1 0 0]'));
+  FAttributes.AddItem('Resources',FResources);
+end;
+
+destructor TPdfPattern.Destroy;
+begin
+  CloseCanvas;
+  inherited;
+end;
+
+procedure TPdfPattern.CloseCanvas;
+begin
+  FreeAndNil(FCanvas);
+  FreeAndNil(FPage);
+end;
+
+procedure TPdfPattern.DrawTile(const AImgName: PDFString; TileW, TileH: single);
+var Img: TPdfXObject;
+    XObjects: TPdfDictionary;
+begin
+  Img := FCanvas.Doc.GetXObject(AImgName);
+  if Img=nil then
+    exit;
+  XObjects := FResources.PdfDictionaryByName('XObject');
+  if XObjects.ValueByName(AImgName)=nil then
+    XObjects.AddItem(AImgName, Img);
+  FCanvas.GSave;
+  // an image XObject is drawn into the unit square, so scaling by the cell
+  // size makes it exactly fill the pattern cell
+  FCanvas.ConcatToCTM(TileW, 0, 0, TileH, 0, 0);
+  FCanvas.ExecuteXObject(AImgName);
+  FCanvas.GRestore;
 end;
 
 
