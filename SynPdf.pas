@@ -9232,6 +9232,9 @@ type
       null: boolean;
       color: integer;
       style: integer;
+      // resource name of the TPdfPattern created for an EMR_CREATEMONOBRUSH
+      // brush, or '' for an ordinary solid/stock brush - see NeedBrushAndPen
+      patternName: PDFString;
     end;
     // current selected font
     font: record
@@ -9265,6 +9268,12 @@ type
       OBJ_FONT:  (FontSpec: TFontSpec; LogFont: TLogFontW);
       OBJ_BRUSH: (BrushColor: integer; BrushNull: boolean; BrushStyle: integer);
     end;
+    // resource name of the TPdfPattern created for obj[i] when it originates
+    // from EMR_CREATEMONOBRUSH, '' otherwise - kept as a separate array (not
+    // a field inside the obj[] variant record above) since Delphi variant
+    // records with overlapping OBJ_PEN/OBJ_FONT/OBJ_BRUSH branches are not
+    // safe to extend with a managed (string) field
+    objPatternName: array of PDFString;
     // SaveDC/RestoreDC stack
     nDC: integer;
     DC: array[0..31] of TPdfEnumState;
@@ -9285,6 +9294,10 @@ type
       Bmi: PBitmapInfo; bits: pointer; clipRect: PRect; xSrcTransform: PXForm; dwRop: DWord;
       transparent: TPdfColorRGB = $FFFFFFFF);
     procedure FillRectangle(const Rect: TRect; ResetNewPath: boolean);
+    // build (or reuse, if an identical tile was already embedded) a
+    // TPdfPattern from an EMR_CREATEMONOBRUSH DIB, and return its resource
+    // name - returns '' if the DIB can't be turned into a pattern
+    function CreateMonoBrushPattern(Bmi: PBitmapInfo; Bits: pointer; iUsage: integer): PDFString;
     // the current value set to SetRGBFillColor (rg)
     property FillColor: integer read fFillColor write SetFillColor;
     // the current value set to SetRGBStrokeColor (RG)
@@ -9329,6 +9342,7 @@ begin
   case R^.iType of
   EMR_HEADER: begin
     SetLength(E.obj,PEnhMetaHeader(R)^.nHandles);
+    SetLength(E.objPatternName,PEnhMetaHeader(R)^.nHandles);
     WinOrg.X := 0;
     WinOrg.Y := 0;
     ViewOrg.X := 0;
@@ -9381,19 +9395,24 @@ begin
       end;
   EMR_CREATEBRUSHINDIRECT:
     with PEMRCreateBrushIndirect(R)^ do
-    if ihBrush-1<cardinal(length(E.Obj)) then
+    if ihBrush-1<cardinal(length(E.Obj)) then begin
       with E.obj[ihBrush-1] do begin
         kind := OBJ_BRUSH;
         BrushColor := lb.lbColor;
         BrushNull := (lb.lbStyle=BS_NULL);
         BrushStyle := lb.lbStyle;
       end;
+      // clear any pattern left over from a previous EMR_CREATEMONOBRUSH that
+      // used to occupy this same (now reused) handle-table slot
+      E.objPatternName[ihBrush-1] := '';
+    end;
   EMR_CREATEMONOBRUSH:
     // was unhandled, leaving ihBrush unregistered so a later EMR_SELECTOBJECT
-    // silently kept stale pen/brush state; no pattern-fill support in
-    // TPdfCanvas, so approximate with the DIB's darker palette entry
+    // silently kept stale pen/brush state; the solid BrushColor below (from
+    // the DIB's darker palette entry) is kept as a fallback in case the real
+    // tiling-pattern creation just below fails for any reason
     with PEMRCreateMonoBrush(R)^ do
-    if ihBrush-1<cardinal(length(E.Obj)) then
+    if ihBrush-1<cardinal(length(E.Obj)) then begin
       with E.obj[ihBrush-1] do begin
         kind := OBJ_BRUSH;
         BrushNull := false;
@@ -9413,6 +9432,16 @@ begin
                 BrushColor := RGB(color1.rgbRed,color1.rgbGreen,color1.rgbBlue);
             end;
       end;
+      E.objPatternName[ihBrush-1] := '';
+      if (offBmi<>0) and (offBits<>0) and (cbBmi>=sizeof(TBitmapInfoHeader)) and
+         (PBitmapInfo(PtrUInt(R)+offBmi)^.bmiHeader.biBitCount=1) then
+        try
+          E.objPatternName[ihBrush-1] := E.CreateMonoBrushPattern(
+            PBitmapInfo(PtrUInt(R)+offBmi), pointer(PtrUInt(R)+offBits), iUsage);
+        except
+          E.objPatternName[ihBrush-1] := ''; // keep the solid BrushColor fallback
+        end;
+    end;
   EMR_EXTCREATEFONTINDIRECTW:
     E.CreateFont(PEMRExtCreateFontIndirect(R));
   EMR_DELETEOBJECT:
@@ -9844,7 +9873,11 @@ begin
     E.Canvas.ClosePath;
   EMR_FILLPATH: begin
     if not brush.Null then begin
-      E.FillColor := brush.color;
+      if brush.patternName<>'' then begin
+        E.Canvas.SetFillPattern(brush.patternName);
+        E.fFillColor := -1; // force 'rg' to be re-emitted next time a solid fill is needed
+      end else
+        E.FillColor := brush.color;
       E.Canvas.Fill;
     end;
     E.Canvas.NewPath;
@@ -9861,7 +9894,11 @@ begin
   EMR_STROKEANDFILLPATH: begin
     if not brush.Null then begin
       E.NeedPen;
-      E.FillColor := brush.color;
+      if brush.patternName<>'' then begin
+        E.Canvas.SetFillPattern(brush.patternName);
+        E.fFillColor := -1; // force 'rg' to be re-emitted next time a solid fill is needed
+      end else
+        E.FillColor := brush.color;
       if not pen.null then
         if PolyFillMode=ALTERNATE then
           E.Canvas.EofillStroke else
@@ -10063,6 +10100,98 @@ begin
   end;
 end;
 
+function TPdfEnum.CreateMonoBrushPattern(Bmi: PBitmapInfo; Bits: pointer; iUsage: integer): PDFString;
+var B: TBitmap;
+    ImgName: PDFString;
+    DibW, DibH, x, y, i: integer;
+    XStep, YStep, ScaleF: single;
+    Pattern: TPdfPattern;
+    used: array of TPdfColorRGB;
+    pix, sentinel: TPdfColorRGB;
+    isUsed: boolean;
+begin
+  result := '';
+  DibW := Bmi^.bmiHeader.biWidth;
+  DibH := abs(Bmi^.bmiHeader.biHeight);
+  if (DibW<=0) or (DibH<=0) then
+    exit;
+  B := TBitmap.Create;
+  try
+    B.Monochrome := true;
+    B.Width := DibW;
+    B.Height := DibH;
+    StretchDIBits(B.Canvas.Handle,0,0,DibW,DibH,0,0,DibW,DibH,Bits,Bmi^,iUsage,SRCCOPY);
+    // TPdfImage.Create() unconditionally adds a color-key /Mask for 24bit
+    // images, using B.TransparentColor (auto-detected, typically white) -
+    // fine for e.g. logos with a white background, but wrong here: GDI
+    // patterns are often 50%-coverage dither tiles meant to blend into a
+    // solid tone when downsampled; making half of the tile transparent
+    // instead breaks that blending and can render as nearly invisible.
+    // To neutralise the mask, TransparentColor must point at a color that
+    // provably does NOT occur in this tile - a hardcoded guess would
+    // silently re-break as soon as a pattern actually uses that color
+    // (e.g. a magenta dashed line), so scan the tile and pick a free one.
+    SetLength(used,0);
+    for y := 0 to DibH-1 do
+      for x := 0 to DibW-1 do begin
+        pix := B.Canvas.Pixels[x,y];
+        isUsed := false;
+        for i := 0 to high(used) do
+          if used[i]=pix then begin
+            isUsed := true;
+            break;
+          end;
+        if not isUsed then begin
+          SetLength(used,length(used)+1);
+          used[high(used)] := pix;
+        end;
+      end;
+    sentinel := 0;
+    repeat
+      isUsed := false;
+      for i := 0 to high(used) do
+        if used[i]=sentinel then begin
+          isUsed := true;
+          break;
+        end;
+      if not isUsed then
+        break;
+      inc(sentinel);
+    until sentinel>=$FFFFFF;
+    B.TransparentColor := sentinel;
+    // register/dedupe the tile bitmap globally, without wiring it into the
+    // current page's own /Resources/XObject (DrawAt=nil) - it belongs in the
+    // pattern's own private Resources, wired below via Pattern.DrawTile
+    ImgName := Canvas.Doc.CreateOrGetImage(B, nil, nil);
+  finally
+    B.Free;
+  end;
+  if ImgName='' then
+    exit;
+  // CreateOrGetImage always names new images 'SynImg'+<n> (6-char prefix);
+  // derive a matching Pattern name so identical DIB tiles reuse one Pattern
+  result := 'SynPat'+copy(ImgName,7,MaxInt);
+  if Canvas.Doc.GetPattern(result)<>nil then
+    exit; // an identical tile was already embedded as a pattern
+  // Die DIB eines GDI-Pattern-Brush ist in logischen Pixeln definiert (der
+  // Aufloesung, mit der die Anwendung zeichnet), nicht in Druckerpixeln:
+  // die damit gefuellten Gitterlinien sind hier 0.75pt = genau 1 logisches
+  // Pixel dick. Ein Musterpixel muss also ebenfalls 1 logisches Pixel gross
+  // sein, damit die Punkte so aussehen wie am Bildschirm. FFactor ist genau
+  // dieser Umrechnungsfaktor (72/FScreenLogPixels, also i.d.R. 0.75).
+  // Ueber die Drucker-DPI (600) skaliert ergaebe ein Musterpixel dagegen
+  // nur 0.12pt - deutlich feiner als ein Bildschirmpixel; das verschmilzt
+  // beim Betrachten zu einem flaechigen Grau statt sichtbarer Punkte.
+  if Canvas.FFactor>0 then
+    ScaleF := Canvas.FFactor else
+    ScaleF := 72/96; // Standard-Bildschirmaufloesung als Rueckfallwert
+  XStep := DibW * ScaleF;
+  YStep := DibH * ScaleF;
+  Pattern := TPdfPattern.Create(Canvas.Doc, XStep, YStep);
+  Pattern.DrawTile(ImgName, XStep, YStep);
+  Canvas.Doc.AddPattern(result, Pattern);
+end;
+
 // simulate gradient (not finished)
 procedure TPdfEnum.GradientFill(data: PEMGradientFill);
 type
@@ -10200,7 +10329,11 @@ begin
   if DC[nDC].brush.null then
     exit;
   Canvas.NewPath;
-  FillColor := DC[nDC].brush.color;
+  if DC[nDC].brush.patternName<>'' then begin
+    Canvas.SetFillPattern(DC[nDC].brush.patternName);
+    fFillColor := -1; // force 'rg' to be re-emitted next time a solid fill is needed
+  end else
+    FillColor := DC[nDC].brush.color;
   with Canvas.BoxI(Rect,true) do
     Canvas.Rectangle(Left,Top,Width,Height);
   Canvas.Fill;
@@ -10228,11 +10361,14 @@ begin
     if iObject<0 then begin // stock object?
       iObject := iObject and $7fffffff;
       case iObject of
-        NULL_BRUSH:
+        NULL_BRUSH: begin
           brush.null := true;
+          brush.patternName := '';
+        end;
         WHITE_BRUSH..BLACK_BRUSH: begin
           brush.color := STOCKBRUSHCOLOR[iObject];
           brush.null := false;
+          brush.patternName := '';
         end;
         NULL_PEN: begin
           if fInLined and ((pen.style<>PS_NULL) or not pen.null) then begin
@@ -10274,6 +10410,7 @@ begin
           brush.null := BrushNull;
           brush.color := BrushColor;
           brush.style := BrushStyle;
+          brush.patternName := objPatternName[iObject-1];
         end;
         OBJ_FONT: begin
           font.spec := FontSpec;
@@ -10337,7 +10474,11 @@ begin
   NeedPen;
   with DC[nDC] do
   if not brush.null then
-    FillColor := brush.color;
+    if brush.patternName<>'' then begin
+      Canvas.SetFillPattern(brush.patternName);
+      fFillColor := -1; // force 'rg' to be re-emitted next time a solid fill is needed
+    end else
+      FillColor := brush.color;
 end;
 
 procedure TPdfEnum.NeedPen;
