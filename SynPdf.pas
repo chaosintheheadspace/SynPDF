@@ -9192,6 +9192,7 @@ function EnumEMFFunc(DC: HDC; var Table: THandleTable; R: PEnhMetaRecord;
 var i: integer;
     InitTransX: XForm;
     polytypes: PByteArray;
+    color0, color1: TRGBQuad;
 begin
   result := true;
   with E.DC[E.nDC] do
@@ -9256,6 +9257,31 @@ begin
         BrushColor := lb.lbColor;
         BrushNull := (lb.lbStyle=BS_NULL);
         BrushStyle := lb.lbStyle;
+      end;
+  EMR_CREATEMONOBRUSH:
+    // was unhandled, leaving ihBrush unregistered so a later EMR_SELECTOBJECT
+    // silently kept stale pen/brush state; no pattern-fill support in
+    // TPdfCanvas, so approximate with the DIB's darker palette entry
+    with PEMRCreateMonoBrush(R)^ do
+    if ihBrush-1<cardinal(length(E.Obj)) then
+      with E.obj[ihBrush-1] do begin
+        kind := OBJ_BRUSH;
+        BrushNull := false;
+        BrushStyle := BS_SOLID;
+        BrushColor := clBlack;
+        if (offBmi<>0) and (cbBmi>=sizeof(TBitmapInfoHeader)) then
+          with PBitmapInfo(PtrUInt(R)+offBmi)^ do
+            if (bmiHeader.biBitCount=1) and
+               (cbBmi>=bmiHeader.biSize+2*sizeof(TRGBQuad)) then begin
+              // bmiColors is declared as array[0..0]; index 1 via pointer
+              // arithmetic since the DIB packs 2 entries for a 1bpp palette
+              color0 := PRGBQuad(PtrUInt(@bmiColors))^;
+              color1 := PRGBQuad(PtrUInt(@bmiColors)+sizeof(TRGBQuad))^;
+              if color0.rgbRed+color0.rgbGreen+color0.rgbBlue<=
+                 color1.rgbRed+color1.rgbGreen+color1.rgbBlue then
+                BrushColor := RGB(color0.rgbRed,color0.rgbGreen,color0.rgbBlue) else
+                BrushColor := RGB(color1.rgbRed,color1.rgbGreen,color1.rgbBlue);
+            end;
       end;
   EMR_EXTCREATEFONTINDIRECTW:
     E.CreateFont(PEMRExtCreateFontIndirect(R));
@@ -10903,7 +10929,7 @@ begin
             PInc := 4;
           for y := 0 to fPixelHeight-1 do
             FWriter.AddRGB(B.ScanLine[y],PInc,fPixelWidth);
-          if (PInc=3) {and (B.TransparentMode=tmFixed)} then begin // HKS_DP 07.11.13 Transparenz auch für tmAuto ermöglichen
+          if (PInc=3) {and (B.TransparentMode=tmFixed)} then begin // HKS_DP 07.11.13 Transparenz auch fï¿½r tmAuto ermï¿½glichen
             // [ min1 max1 ... minn maxn ]
             TransparentColor := B.TransparentColor;
             FAttributes.AddItem('Mask',TPdfArray.CreateReals(nil,
